@@ -323,10 +323,25 @@ public final class AKReader: @unchecked Sendable {
     }
     
     /// 跳过当前条目的数据
-    /// - Throws: AKError
+    ///
+    /// - Note: 对加密条目调用此方法时，libarchive 会尝试解密数据，在没有提供密码的情况下
+    ///   返回错误消息 `"Reading encrypted data is not currently supported"`（通常为
+    ///   `ARCHIVE_FAILED` 或 `ARCHIVE_FATAL`）。此方法会将该特定错误静默处理
+    ///   （视为成功跳过），避免调用方需要在每个调用点检查条目是否加密。
+    /// - Throws: AKError（非加密相关的真正错误仍会抛出）
     public func skipCurrentEntry() throws {
         guard let archive else { return }
         let result = libarchive.archive_read_data_skip(archive)
+        guard result != AKError.ARCHIVE_OK && result != AKError.ARCHIVE_WARN else { return }
+        // 特殊处理：加密条目在无密码时 skip 会返回错误，
+        // 错误消息为 "Reading encrypted data is not currently supported"。
+        // 静默忽略此类错误，并重置错误状态使归档对象可继续使用。
+        let errStr = libarchive.archive_error_string(archive).map { String(cString: $0) } ?? ""
+        let lower = errStr.lowercased()
+        if lower.contains("encrypted") || lower.contains("not currently supported") {
+            libarchive.archive_clear_error(archive)
+            return
+        }
         try checkResult(result)
     }
     
@@ -377,6 +392,11 @@ public final class AKReader: @unchecked Sendable {
     // MARK: - 解压到磁盘
     
     /// 将当前条目解压到磁盘（使用当前工作目录）
+    ///
+    /// - Important: 此方法使用 `archive_read_extract`，该函数内部创建独立的 disk writer，
+    ///   **不会继承** reader 上注册的密码。对于加密归档，请使用 `extractAll(to:flags:progress:)`，
+    ///   它通过 `archive_read_data` 读取解密后的数据再手动写入磁盘，可正确处理加密条目。
+    ///
     /// - Parameters:
     ///   - entry: 要解压的条目
     ///   - flags: 解压标志，默认为空
@@ -390,16 +410,15 @@ public final class AKReader: @unchecked Sendable {
     }
     
     /// 将归档中所有条目解压到指定目录
+    ///
+    /// 此方法通过 `archive_read_data` 读取数据后手动写入磁盘，可正确处理加密归档。
+    /// 与 `extractCurrentEntry` 不同，不依赖 `archive_read_extract`（后者不继承密码）。
+    ///
     /// - Parameters:
     ///   - destinationURL: 目标目录 URL
-    ///   - flags: 解压标志，默认恢复时间和权限
+    ///   - flags: 解压标志，默认恢复时间和权限（当前用于目录权限和时间戳恢复）
     ///   - progress: 进度回调，参数为当前条目
     /// - Throws: AKError
-    ///
-    /// - Note: 此方法内部需要切换进程工作目录（`chdir`），这是 libarchive
-    ///   `archive_read_extract` 的要求。切换工作目录是进程级操作，在多线程环境下
-    ///   可能影响其他线程。如需在多线程环境中使用，请在调用方自行加锁，或改用
-    ///   `archive_read_extract2` 配合 disk writer 的方式。
     public func extractAll(
         to destinationURL: URL,
         flags: AKExtractFlags = [.time, .permissions],
@@ -411,20 +430,73 @@ public final class AKReader: @unchecked Sendable {
         // 确保目标目录存在
         try FileManager.default.createDirectory(at: destinationURL, withIntermediateDirectories: true)
         
-        // 使用 POSIX chdir 切换工作目录（进程级操作，非线程安全）
-        let destPath = destinationURL.path
-        let originalPath = FileManager.default.currentDirectoryPath
-        guard FileManager.default.changeCurrentDirectoryPath(destPath) else {
-            throw AKError.cannotOpenFile("无法切换到目标目录: \(destPath)")
-        }
-        // 使用 defer 确保即使抛出异常也能恢复工作目录
-        defer {
-            _ = FileManager.default.changeCurrentDirectoryPath(originalPath)
-        }
+        let fm = FileManager.default
         
         while let entry = try nextEntry() {
             progress?(entry)
-            try extractCurrentEntry(entry, flags: flags)
+            
+            guard let pathname = entry.pathname, !pathname.isEmpty else {
+                try skipCurrentEntry()
+                continue
+            }
+            
+            // 安全路径检查：防止路径穿越攻击（../ 或绝对路径）
+            let safePath = pathname
+                .components(separatedBy: "/")
+                .filter { !$0.isEmpty && $0 != ".." && $0 != "." }
+                .joined(separator: "/")
+            guard !safePath.isEmpty else {
+                try skipCurrentEntry()
+                continue
+            }
+            
+            let destURL = destinationURL.appendingPathComponent(safePath)
+            
+            switch entry.fileType {
+            case .directory:
+                // 创建目录
+                try fm.createDirectory(at: destURL, withIntermediateDirectories: true)
+                // 恢复目录权限
+                if flags.contains(.permissions) {
+                    let perms = Int(entry.permissions)
+                    try? fm.setAttributes([.posixPermissions: perms], ofItemAtPath: destURL.path)
+                }
+                // 恢复目录修改时间
+                if flags.contains(.time), let mtime = entry.modificationTime {
+                    try? fm.setAttributes([.modificationDate: mtime], ofItemAtPath: destURL.path)
+                }
+                
+            case .symbolicLink:
+                // 创建符号链接
+                if let target = entry.symlinkTarget {
+                    // 确保父目录存在
+                    try fm.createDirectory(at: destURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+                    // 若目标已存在则先删除
+                    try? fm.removeItem(at: destURL)
+                    try fm.createSymbolicLink(atPath: destURL.path, withDestinationPath: target)
+                } else {
+                    try skipCurrentEntry()
+                }
+                
+            case .regular:
+                // 确保父目录存在
+                try fm.createDirectory(at: destURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+                // 流式分块写入：避免将整个文件内容一次性读入内存（防止大文件内存暴涨）
+                try _extractEntryToFile(at: destURL)
+                // 恢复文件权限
+                if flags.contains(.permissions) {
+                    let perms = Int(entry.permissions)
+                    try? fm.setAttributes([.posixPermissions: perms], ofItemAtPath: destURL.path)
+                }
+                // 恢复文件修改时间
+                if flags.contains(.time), let mtime = entry.modificationTime {
+                    try? fm.setAttributes([.modificationDate: mtime], ofItemAtPath: destURL.path)
+                }
+                
+            default:
+                // 其他类型（设备文件、FIFO 等）跳过
+                try skipCurrentEntry()
+            }
         }
     }
     
@@ -512,10 +584,57 @@ public final class AKReader: @unchecked Sendable {
         }
     }
     
+    /// 流式将当前条目数据写入磁盘文件（固定缓冲区分块读写，避免大文件内存暴涨）
+    ///
+    /// 使用 `archive_read_data` 分块读取（每次最多 `bufferSize` 字节），
+    /// 通过 `FileHandle` 追加写入目标文件，峰值内存占用仅为单个缓冲区大小（64KB）。
+    ///
+    /// - Parameter destURL: 目标文件 URL（父目录必须已存在）
+    /// - Throws: AKError（读取失败）或 CocoaError（文件写入失败）
+    private func _extractEntryToFile(at destURL: URL) throws {
+        guard let archive else {
+            throw AKError.cannotCreateArchive("归档未打开")
+        }
+        // 创建目标文件（若已存在则截断）
+        FileManager.default.createFile(atPath: destURL.path, contents: nil)
+        let fileHandle: FileHandle
+        do {
+            fileHandle = try FileHandle(forWritingTo: destURL)
+        } catch {
+            throw AKError.cannotOpenFile(destURL.path)
+        }
+        defer { try? fileHandle.close() }
+        
+        // 固定大小缓冲区（64KB），峰值内存占用仅为此大小
+        let bufferSize = 65536
+        var buffer = [UInt8](repeating: 0, count: bufferSize)
+        
+        while true {
+            let bytesRead = libarchive.archive_read_data(archive, &buffer, bufferSize)
+            if bytesRead == 0 { break }  // EOF
+            if bytesRead < 0 {
+                let errStr = libarchive.archive_error_string(archive).map { String(cString: $0) }
+                throw AKError.failed(errStr ?? "读取数据失败")
+            }
+            // 仅写入实际读取的字节数，避免写入缓冲区末尾的脏数据
+            let chunk = Data(bytes: buffer, count: Int(bytesRead))
+            if #available(macOS 10.15.4, iOS 13.4, watchOS 6.2, tvOS 13.4, *) {
+                try fileHandle.write(contentsOf: chunk)
+            } else {
+                fileHandle.write(chunk)
+            }
+        }
+    }
+    
     /// 内部实现：遍历条目头部，检测是否存在加密条目
     ///
     /// libarchive 在读取加密条目头部时会设置 `archive_entry_is_encrypted`，
     /// 即使没有提供密码也能检测到加密标志（ZIP AES 等格式在头部即标记加密）。
+    ///
+    /// - Important: 对加密条目**不调用** `archive_read_data_skip`，因为跳过加密数据
+    ///   会触发 libarchive 的解密尝试，在没有密码时产生
+    ///   `ARCHIVE_FATAL: "Reading encrypted data is not currently supported"` 错误。
+    ///   一旦检测到加密条目即可提前返回 `true`，无需继续遍历。
     private func _detectEncryption() throws -> Bool {
         guard let archive else {
             throw AKError.cannotCreateArchive("归档未打开")
@@ -532,9 +651,12 @@ public final class AKReader: @unchecked Sendable {
             guard let ptr = entryPtr else { continue }
             // 检查条目是否加密（数据或元数据）
             if libarchive.archive_entry_is_encrypted(ptr) != 0 {
+                // 发现加密条目，立即返回 true。
+                // 不调用 archive_read_data_skip：对加密条目跳过数据会触发解密尝试，
+                // 在无密码时产生 ARCHIVE_FATAL "Reading encrypted data is not currently supported"。
                 return true
             }
-            // 跳过当前条目数据，继续检查下一个
+            // 非加密条目：跳过数据，继续检查下一个
             libarchive.archive_read_data_skip(archive)
         }
         return false

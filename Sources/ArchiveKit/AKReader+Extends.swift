@@ -548,6 +548,10 @@ extension AKReader {
     ///
     /// - Note: libarchive 的 `archive_format()` 在读取第一个条目头部后才能确定格式，
     ///   因此格式/过滤器信息必须在遍历条目**之后**读取。
+    ///
+    /// - Important: 对加密条目**不调用** `skipCurrentEntry()`，因为跳过加密数据会触发
+    ///   libarchive 的解密尝试，在没有密码时产生
+    ///   `ARCHIVE_FATAL: "Reading encrypted data is not currently supported"` 错误。
     private func _buildInfo(sourcePath: String?) throws -> AKArchiveInfo {
         var entries: [AKEntry] = []
         var paths: [String] = []
@@ -557,7 +561,11 @@ extension AKReader {
             if entry.isEncrypted { encrypted = true }
             if let path = entry.pathname { paths.append(path) }
             if let cloned = entry.clone() { entries.append(cloned) }
-            try skipCurrentEntry()
+            // 加密条目不调用 skipCurrentEntry()：跳过加密数据会触发解密尝试，
+            // 在无密码时产生 ARCHIVE_FATAL "Reading encrypted data is not currently supported"。
+            if !entry.isEncrypted {
+                try skipCurrentEntry()
+            }
         }
         
         // 遍历完成后读取格式/过滤器信息（libarchive 在读取第一个条目后才确定格式）
