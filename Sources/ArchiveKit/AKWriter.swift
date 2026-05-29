@@ -7,7 +7,11 @@ import Foundation
 internal import libarchive
 
 /// 归档写入器，用于创建归档文件
-public final class AKWriter {
+///
+/// - Note: `@unchecked Sendable` — libarchive 的 archive 指针本身不是线程安全的，
+///   调用方需确保不在多个线程中并发访问同一个 AKWriter 实例。
+///   每个并发任务应使用独立的 AKWriter 实例。
+public final class AKWriter: @unchecked Sendable {
     
     // MARK: - 内部属性
     
@@ -67,7 +71,12 @@ public final class AKWriter {
         formatOptions: [String: String] = [:],
         compressionLevel: Int? = nil
     ) throws {
+        guard format.isRealFormat else {
+            throw AKError.cannotCreateArchive("不支持的格式: \(format)")
+        }
+        try validateCompressionLevel(compressionLevel)
         try prepareArchive(format: format, filter: filter)
+        do {
         // 压缩级别必须在 archive_write_open 之前设置（libarchive 状态机限制）
         // 先尝试过滤器选项（gzip/xz/zstd 等），再尝试格式选项（zip 等）
         // ARCHIVE_WARN/ARCHIVE_FAILED 表示不支持（忽略），ARCHIVE_FATAL 表示严重错误（抛出）
@@ -77,6 +86,7 @@ public final class AKWriter {
                 let errStr = archive.flatMap { libarchive.archive_error_string($0) }.map { String(cString: $0) }
                 libarchive.archive_write_free(archive)
                 archive = nil
+                isOpen = false
                 throw AKError.failed(errStr ?? "设置压缩级别失败")
             }
             // 若过滤器不支持，尝试格式选项（如 ZIP 格式）
@@ -87,6 +97,7 @@ public final class AKWriter {
                     let errStr = archive.flatMap { libarchive.archive_error_string($0) }.map { String(cString: $0) }
                     libarchive.archive_write_free(archive)
                     archive = nil
+                    isOpen = false
                     throw AKError.failed(errStr ?? "设置压缩级别失败")
                 }
             }
@@ -102,6 +113,7 @@ public final class AKWriter {
                 let errStr = archive.flatMap { libarchive.archive_error_string($0) }.map { String(cString: $0) }
                 libarchive.archive_write_free(archive)
                 archive = nil
+                isOpen = false
                 throw AKError.cannotCreateArchive(errStr ?? "设置密码失败")
             }
         }
@@ -110,9 +122,14 @@ public final class AKWriter {
             let errStr = archive.flatMap { libarchive.archive_error_string($0) }.map { String(cString: $0) }
             libarchive.archive_write_free(archive)
             archive = nil
+            isOpen = false
             throw AKError.cannotOpenFile(errStr ?? path)
         }
-        isOpen = true
+            isOpen = true
+        } catch {
+            cleanupArchive()
+            throw error
+        }
     }
     
     /// 创建归档文件（URL 版本）
@@ -122,18 +139,20 @@ public final class AKWriter {
     ///   - filter: 压缩过滤器，默认无压缩
     ///   - passphrase: 加密密码（仅支持加密格式，如 ZIP AES），nil 表示不加密
     ///   - formatOptions: 格式选项字典，键为选项名，值为选项值（在打开前设置）
+    ///   - compressionLevel: 压缩级别（0-9），nil 表示使用默认级别。
     /// - Throws: AKError
     public func open(
         url: URL,
         format: AKFormat = .tarPaxRestricted,
         filter: AKFilter = .none,
         passphrase: String? = nil,
-        formatOptions: [String: String] = [:]
+        formatOptions: [String: String] = [:],
+        compressionLevel: Int? = nil
     ) throws {
         guard url.isFileURL else {
             throw AKError.invalidPath(url.absoluteString)
         }
-        try open(path: url.path, format: format, filter: filter, passphrase: passphrase, formatOptions: formatOptions)
+        try open(path: url.path, format: format, filter: filter, passphrase: passphrase, formatOptions: formatOptions, compressionLevel: compressionLevel)
     }
     
     /// 创建归档到内存，返回写入完成后的数据
@@ -160,7 +179,12 @@ public final class AKWriter {
         filter: AKFilter = .none,
         compressionLevel: Int? = nil
     ) throws -> AKMemoryWriteContext {
+        guard format.isRealFormat else {
+            throw AKError.cannotCreateArchive("不支持的格式: \(format)")
+        }
+        try validateCompressionLevel(compressionLevel)
         try prepareArchive(format: format, filter: filter)
+        do {
         // 压缩级别必须在 archive_write_open 之前设置（libarchive 状态机限制）
         // 先尝试过滤器选项（gzip/xz/zstd 等），再尝试格式选项（zip 等）
         // ARCHIVE_WARN/ARCHIVE_FAILED 表示不支持（忽略），ARCHIVE_FATAL 表示严重错误（抛出）
@@ -170,6 +194,7 @@ public final class AKWriter {
                 let errStr = archive.flatMap { libarchive.archive_error_string($0) }.map { String(cString: $0) }
                 libarchive.archive_write_free(archive)
                 archive = nil
+                isOpen = false
                 throw AKError.failed(errStr ?? "设置压缩级别失败")
             }
             // 若过滤器不支持，尝试格式选项（如 ZIP 格式）
@@ -179,6 +204,7 @@ public final class AKWriter {
                     let errStr = archive.flatMap { libarchive.archive_error_string($0) }.map { String(cString: $0) }
                     libarchive.archive_write_free(archive)
                     archive = nil
+                    isOpen = false
                     throw AKError.failed(errStr ?? "设置压缩级别失败")
                 }
             }
@@ -189,10 +215,15 @@ public final class AKWriter {
             let errStr = archive.flatMap { libarchive.archive_error_string($0) }.map { String(cString: $0) }
             libarchive.archive_write_free(archive)
             archive = nil
+            isOpen = false
             throw AKError.cannotCreateArchive(errStr ?? "无法创建内存归档")
         }
-        isOpen = true
-        return context
+            isOpen = true
+            return context
+        } catch {
+            cleanupArchive()
+            throw error
+        }
     }
     
     /// 关闭内存归档并返回最终数据
@@ -211,12 +242,14 @@ public final class AKWriter {
         let closeResult = libarchive.archive_write_close(archive)
         // 2. close 完成后所有数据已写入 context.chunks，此时获取最终数据
         let data = context.finalData
-        // 3. 释放归档对象（必须调用，否则内存泄漏）
+        // 3. 在 free 之前捕获错误信息；free 后再访问 archive_error_string 会悬垂。
+        let errStr = libarchive.archive_error_string(archive).map { String(cString: $0) }
+        // 4. 释放归档对象（必须调用，否则内存泄漏）
         libarchive.archive_write_free(archive)
         self.archive = nil
         isOpen = false
-        // 4. 检查 close 结果（在 free 之后，避免访问已释放的 archive）
-        try checkResultWithoutArchive(closeResult)
+        // 5. 检查 close 结果
+        try checkResultWithoutArchive(closeResult, errorString: errStr)
         return data
     }
     
@@ -556,15 +589,25 @@ public final class AKWriter {
             }
             let archivePath = basePath + "/" + relativePath
             
-            progress?(filePath)
+            // 修复：resourceValues 获取失败时回退到文件属性判断，避免静默跳过条目
+            let isSymlink: Bool
+            let isDirectory: Bool
+            if let resourceValues = try? fileURL.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]) {
+                isSymlink = resourceValues.isSymbolicLink ?? false
+                isDirectory = resourceValues.isDirectory ?? false
+            } else {
+                // resourceValues 获取失败时，回退到 FileManager.attributesOfItem 判断
+                let attrs = (try? FileManager.default.attributesOfItem(atPath: filePath)) ?? [:]
+                let fileType = attrs[.type] as? FileAttributeType
+                isSymlink = fileType == .typeSymbolicLink
+                isDirectory = fileType == .typeDirectory
+            }
             
-            let resourceValues = try fileURL.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
-            
-            if resourceValues.isSymbolicLink == true {
+            if isSymlink {
                 // 处理符号链接
                 let target = try FileManager.default.destinationOfSymbolicLink(atPath: filePath)
                 try addSymlink(as: archivePath, target: target)
-            } else if resourceValues.isDirectory == true {
+            } else if isDirectory {
                 let attrs = try FileManager.default.attributesOfItem(atPath: filePath)
                 let perms = (attrs[.posixPermissions] as? Int).map { UInt16($0 & 0o7777) } ?? 0o755
                 let modDate = attrs[.modificationDate] as? Date ?? Date()
@@ -572,6 +615,9 @@ public final class AKWriter {
             } else {
                 try addFile(at: filePath, as: archivePath)
             }
+            // 修复：progress 回调对所有条目类型（文件、目录、符号链接）均调用，
+            // 原代码仅在 else 分支（普通文件）后调用，导致目录和符号链接不触发进度回调。
+            progress?(filePath)
         }
     }
     
@@ -598,6 +644,7 @@ public final class AKWriter {
         if archive != nil {
             close()
         }
+        isOpen = false
         guard let newArchive = libarchive.archive_write_new() else {
             throw AKError.cannotCreateArchive("无法创建写入器")
         }
@@ -609,6 +656,7 @@ public final class AKWriter {
             let errStr = libarchive.archive_error_string(archive).map { String(cString: $0) }
             libarchive.archive_write_free(archive)
             archive = nil
+            isOpen = false
             throw AKError.cannotCreateArchive(errStr ?? "不支持的格式: \(format)")
         }
         
@@ -618,6 +666,7 @@ public final class AKWriter {
             let errStr = libarchive.archive_error_string(archive).map { String(cString: $0) }
             libarchive.archive_write_free(archive)
             archive = nil
+            isOpen = false
             throw AKError.cannotCreateArchive(errStr ?? "不支持的过滤器: \(filter)")
         }
     }
@@ -657,11 +706,26 @@ public final class AKWriter {
     }
     
     /// 在 archive 已被 free 后检查结果（不访问 archive 指针）
-    private func checkResultWithoutArchive(_ result: Int32) throws {
+    private func checkResultWithoutArchive(_ result: Int32, errorString: String? = nil) throws {
         guard result != AKError.ARCHIVE_OK && result != AKError.ARCHIVE_WARN else { return }
-        if let error = AKError.from(code: result, errorString: nil) {
+        if let error = AKError.from(code: result, errorString: errorString) {
             throw error
         }
+    }
+    
+    private func validateCompressionLevel(_ level: Int?) throws {
+        guard let level else { return }
+        guard (0...9).contains(level) else {
+            throw AKError.failed("压缩级别必须在 0...9 范围内: \(level)")
+        }
+    }
+    
+    private func cleanupArchive() {
+        if let archive {
+            libarchive.archive_write_free(archive)
+            self.archive = nil
+        }
+        isOpen = false
     }
 }
 
@@ -732,8 +796,8 @@ extension AKWriter {
         filter: AKFilter = .gzip
     ) throws {
         let writer = AKWriter()
-        try writer.open(path: outputPath, format: format, filter: filter)
         defer { writer.close() }
+        try writer.open(path: outputPath, format: format, filter: filter)
         
         for path in filePaths {
             try writer.addFile(at: path)
@@ -754,8 +818,8 @@ extension AKWriter {
         filter: AKFilter = .gzip
     ) throws {
         let writer = AKWriter()
-        try writer.open(path: outputPath, format: format, filter: filter)
         defer { writer.close() }
+        try writer.open(path: outputPath, format: format, filter: filter)
         
         try writer.addDirectory(at: directoryPath)
     }

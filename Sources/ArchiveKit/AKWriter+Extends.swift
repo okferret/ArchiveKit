@@ -108,6 +108,7 @@ extension AKWriter {
         @AKArchiveItemBuilder items: () -> [AKArchiveItem]
     ) throws {
         let writer = AKWriter()
+        defer { writer.close() }
         // compressionLevel 必须在 open 之前设置（libarchive 状态机限制），
         // 通过 open 的 compressionLevel 参数在 prepareArchive 之后、archive_write_open 之前设置。
         try writer.open(
@@ -118,7 +119,6 @@ extension AKWriter {
             formatOptions: configuration.formatOptions,
             compressionLevel: configuration.compressionLevel
         )
-        defer { writer.close() }
         try writer.addItems(items())
     }
     
@@ -134,6 +134,7 @@ extension AKWriter {
         @AKArchiveItemBuilder items: () -> [AKArchiveItem]
     ) throws -> Data {
         let writer = AKWriter()
+        defer { writer.close() }
         // compressionLevel 必须在 open 之前设置（libarchive 状态机限制），
         // 通过 openMemory 的 compressionLevel 参数在 prepareArchive 之后、open 之前设置。
         let context = try writer.openMemory(
@@ -145,7 +146,6 @@ extension AKWriter {
             try writer.addItems(items())
             return try writer.closeMemory(context: context)
         } catch {
-            writer.close()
             throw error
         }
     }
@@ -258,7 +258,7 @@ extension AKWriter {
     /// - Parameters:
     ///   - filePaths: 源文件路径列表
     ///   - outputPath: 输出归档路径
-    ///   - configuration: 写入器配置
+    ///   - configuration: 写入器配置（含 compressionLevel）
     /// - Throws: AKError
     public static func archiveAsync(
         files filePaths: [String],
@@ -267,14 +267,16 @@ extension AKWriter {
     ) async throws {
         try await Task.detached(priority: .userInitiated) {
             let writer = AKWriter()
+            defer { writer.close() }
+            // 修复：传递 compressionLevel，确保配置完整生效
             try writer.open(
                 path: outputPath,
                 format: configuration.format,
                 filter: configuration.filter,
                 passphrase: configuration.passphrase,
-                formatOptions: configuration.formatOptions
+                formatOptions: configuration.formatOptions,
+                compressionLevel: configuration.compressionLevel
             )
-            defer { writer.close() }
             for path in filePaths {
                 try writer.addFile(at: path)
             }
@@ -286,7 +288,7 @@ extension AKWriter {
     /// - Parameters:
     ///   - directoryPath: 源目录路径
     ///   - outputPath: 输出归档路径
-    ///   - configuration: 写入器配置
+    ///   - configuration: 写入器配置（含 compressionLevel）
     ///   - progress: 进度回调（在后台线程调用）
     /// - Throws: AKError
     public static func archiveAsync(
@@ -297,14 +299,16 @@ extension AKWriter {
     ) async throws {
         try await Task.detached(priority: .userInitiated) {
             let writer = AKWriter()
+            defer { writer.close() }
+            // 修复：传递 compressionLevel，确保配置完整生效
             try writer.open(
                 path: outputPath,
                 format: configuration.format,
                 filter: configuration.filter,
                 passphrase: configuration.passphrase,
-                formatOptions: configuration.formatOptions
+                formatOptions: configuration.formatOptions,
+                compressionLevel: configuration.compressionLevel
             )
-            defer { writer.close() }
             try writer.addDirectory(at: directoryPath, progress: progress)
         }.value
     }
@@ -322,6 +326,7 @@ extension AKWriter {
     ) async throws -> Data {
         try await Task.detached(priority: .userInitiated) {
             let writer = AKWriter()
+            defer { writer.close() }
             let context = try writer.openMemory(
                 format: configuration.format,
                 filter: configuration.filter,
@@ -333,7 +338,6 @@ extension AKWriter {
                 }
                 return try writer.closeMemory(context: context)
             } catch {
-                writer.close()
                 throw error
             }
         }.value
@@ -359,6 +363,7 @@ extension AKWriter {
         let capturedItems = items
         try await Task.detached(priority: .userInitiated) {
             let writer = AKWriter()
+            defer { writer.close() }
             // compressionLevel 必须在 open 之前设置（libarchive 状态机限制）
             try writer.open(
                 path: capturedOutput,
@@ -368,7 +373,6 @@ extension AKWriter {
                 formatOptions: capturedConfig.formatOptions,
                 compressionLevel: capturedConfig.compressionLevel
             )
-            defer { writer.close() }
             try writer.addItems(capturedItems)
         }.value
     }

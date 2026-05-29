@@ -544,12 +544,20 @@ public final class AKEntry: @unchecked Sendable {
     // MARK: - 从 stat 结构复制
     
     /// 从文件路径复制 stat 信息到条目
+    ///
     /// - Parameter path: 文件路径
-    public func copyStatFromPath(_ path: String) {
+    /// - Returns: `true` 表示成功复制，`false` 表示文件不存在或无法访问（`lstat` 失败）
+    ///
+    /// - Note: 修复：原实现在 `lstat` 失败时静默忽略，调用方无法区分成功与失败。
+    ///   现在返回 `Bool` 以便调用方判断操作结果。
+    @discardableResult
+    public func copyStatFromPath(_ path: String) -> Bool {
         var st = stat()
-        if lstat(path, &st) == 0 {
-            archive_entry_copy_stat(pointer, &st)
+        guard lstat(path, &st) == 0 else {
+            return false
         }
+        archive_entry_copy_stat(pointer, &st)
+        return true
     }
 }
 

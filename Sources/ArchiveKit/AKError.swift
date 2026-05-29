@@ -6,12 +6,21 @@
 import Foundation
 
 /// ArchiveKit 错误类型
+///
+/// - Note: `.ok` 和 `.eof` 在语义上不是真正的错误，它们对应 libarchive 的
+///   `ARCHIVE_OK`（0）和 `ARCHIVE_EOF`（1）状态码，仅用于内部状态映射。
+///   在公开 API 中，成功通过返回值表示，EOF 通过 `nextEntry()` 返回 `nil` 表示，
+///   这两个 case 不会被 `throw`，仅在 `AKError.from(code:errorString:)` 中用于判断。
 public enum AKError: Error, CustomStringConvertible {
     
-    /// 操作成功（通常不作为错误使用）
+    /// 操作成功（不作为错误抛出，仅用于内部状态码映射）
+    ///
+    /// - Important: 此 case 不应被 `throw`。公开 API 通过返回值表示成功。
     case ok
     
-    /// 到达归档末尾
+    /// 到达归档末尾（不作为错误抛出，仅用于内部状态码映射）
+    ///
+    /// - Important: 此 case 不应被 `throw`。公开 API 通过 `nextEntry()` 返回 `nil` 表示 EOF。
     case eof
     
     /// 可重试的错误

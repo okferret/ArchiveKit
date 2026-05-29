@@ -2330,7 +2330,9 @@ private func makePlainZip() throws -> String {
     try? content.write(to: tempFile)
     
     let entry = AKEntry()
-    entry.copyStatFromPath(tempFile.path)
+    // 修复：验证 copyStatFromPath 返回值为 true（文件存在且可访问）
+    let success = entry.copyStatFromPath(tempFile.path)
+    #expect(success, "copyStatFromPath 应成功返回 true")
     
     // 复制 stat 后应有文件大小和类型
     #expect(entry.size != nil)
@@ -2339,9 +2341,11 @@ private func makePlainZip() throws -> String {
 }
 
 @Test func testAKEntryCopyStatFromNonExistentPath() {
-    // 测试从不存在的路径复制 stat（应静默失败）
+    // 测试从不存在的路径复制 stat（应返回 false）
     let entry = AKEntry()
-    entry.copyStatFromPath("/nonexistent/path/file.txt")
+    // 修复：验证 copyStatFromPath 返回值为 false（文件不存在）
+    let success = entry.copyStatFromPath("/nonexistent/path/file.txt")
+    #expect(!success, "copyStatFromPath 对不存在的路径应返回 false")
     // 不应崩溃，条目保持默认状态
     #expect(entry.fileType == .unknown)
 }
@@ -3112,8 +3116,8 @@ private func makePlainZip() throws -> String {
     
     let extracted = try { () throws -> Data? in
         let reader = AKReader()
-        try reader.open(data: archiveData)
         defer { reader.close() }
+        try reader.open(data: archiveData)
         while let entry = try reader.nextEntry() {
             if entry.pathname == "test.txt" {
                 return try reader.readCurrentEntryData()
@@ -3123,4 +3127,302 @@ private func makePlainZip() throws -> String {
         return nil
     }()
     #expect(extracted == data)
+}
+
+// MARK: - 严格审查回归测试
+
+@Test func testAKReaderOpenFailureLeavesClosedState() {
+    let reader = AKReader()
+    #expect(!reader.isArchiveOpen)
+    
+    #expect(throws: (any Error).self) {
+        try reader.open(path: "/nonexistent/path/archive.tar")
+    }
+    
+    // 严格回归：open 失败后必须处于关闭状态，且可安全重复 close。
+    #expect(!reader.isArchiveOpen)
+    reader.close()
+    #expect(!reader.isArchiveOpen)
+}
+
+@Test func testAKWriterOpenFailureLeavesClosedState() {
+    let writer = AKWriter()
+    #expect(!writer.isArchiveOpen)
+    
+    #expect(throws: (any Error).self) {
+        try writer.open(path: "/nonexistent/dir/archive.tar", format: .tarPaxRestricted, filter: .none)
+    }
+    
+    // 严格回归：open 失败后必须处于关闭状态，且可安全重复 close。
+    #expect(!writer.isArchiveOpen)
+    writer.close()
+    #expect(!writer.isArchiveOpen)
+}
+
+@Test func testStaticConvenienceFailuresAreSafe() {
+    #expect(throws: (any Error).self) {
+        _ = try AKReader.listEntries(at: "/nonexistent/path/archive.tar")
+    }
+    #expect(throws: (any Error).self) {
+        _ = try AKReader.listAllEntries(at: "/nonexistent/path/archive.tar")
+    }
+    #expect(throws: (any Error).self) {
+        _ = try AKReader.extractData(for: "file.txt", from: "/nonexistent/path/archive.tar")
+    }
+    #expect(throws: (any Error).self) {
+        _ = try AKReader.info(at: "/nonexistent/path/archive.tar")
+    }
+    #expect(throws: (any Error).self) {
+        try AKReader.stream(from: "/nonexistent/path/archive.tar") { _, _ in true }
+    }
+}
+
+// MARK: - 全面审查回归测试
+
+@Test func testAKWriterRejectsInvalidCompressionLevel() {
+    let writer = AKWriter()
+    #expect(throws: (any Error).self) {
+        try writer.open(path: "/tmp/invalid-compression.tar.gz", format: .tarPaxRestricted, filter: .gzip, compressionLevel: 10)
+    }
+    #expect(!writer.isArchiveOpen)
+}
+
+@Test func testAKWriterRejectsBaseMaskFormat() {
+    let writer = AKWriter()
+    #expect(throws: (any Error).self) {
+        try writer.open(path: "/tmp/invalid-format.archive", format: .baseMask, filter: .none)
+    }
+    #expect(!writer.isArchiveOpen)
+}
+
+@Test func testAKReaderExtractDataForPathsCanContinueAfterEarlyCompletion() throws {
+    let tempDir = FileManager.default.temporaryDirectory
+    let archivePath = tempDir.appendingPathComponent("test_extract_paths_continue_\(UUID().uuidString).tar").path
+    defer { try? FileManager.default.removeItem(atPath: archivePath) }
+    
+    let writer = AKWriter()
+    try writer.open(path: archivePath, format: .tarPaxRestricted, filter: .none)
+    try writer.addData("one".data(using: .utf8)!, as: "one.txt")
+    try writer.addData("two".data(using: .utf8)!, as: "two.txt")
+    writer.close()
+    
+    let reader = AKReader()
+    defer { reader.close() }
+    try reader.open(path: archivePath)
+    
+    let result = try reader.extractData(forPaths: ["one.txt"])
+    #expect(result["one.txt"] == "one".data(using: .utf8)!)
+    
+    // 回归：extractData(forPaths:) 在找到最后一个目标后也要跳过当前条目的剩余数据，
+    // 否则调用方继续读取同一个 reader 时状态可能不一致。
+    let next = try reader.nextEntry()
+    #expect(next?.pathname == "two.txt")
+    let nextData = try reader.readCurrentEntryData()
+    #expect(nextData == "two".data(using: .utf8)!)
+}
+
+// MARK: - 全功能覆盖补充测试
+
+@Test func testAKWriterOpenURLAndReaderOpenURLSuccess() throws {
+    let archiveURL = FileManager.default.temporaryDirectory.appendingPathComponent("url_open_\(UUID().uuidString).zip")
+    defer { try? FileManager.default.removeItem(at: archiveURL) }
+    let payload = Data("url payload".utf8)
+    
+    let writer = AKWriter()
+    try writer.open(url: archiveURL, format: .zip, filter: .none, compressionLevel: 0)
+    try writer.addData(payload, as: "payload.txt")
+    writer.close()
+    
+    let reader = AKReader()
+    defer { reader.close() }
+    try reader.open(url: archiveURL)
+    #expect(reader.isArchiveOpen)
+    #expect(reader.filterCount >= 1)
+    #expect(reader.fileCount >= 0)
+    
+    let entry = try reader.nextEntry()
+    #expect(reader.format != nil)
+    #expect(reader.formatName != nil)
+    #expect(entry?.pathname == "payload.txt")
+    #expect(try reader.readCurrentEntryData() == payload)
+}
+
+@Test func testAKWriterOpenWithCompressionLevelToFile() throws {
+    let archivePath = FileManager.default.temporaryDirectory.appendingPathComponent("compression_file_\(UUID().uuidString).tar.gz").path
+    defer { try? FileManager.default.removeItem(atPath: archivePath) }
+    let payload = Data(repeating: 65, count: 4096)
+    
+    let writer = AKWriter()
+    try writer.open(path: archivePath, format: .tarPaxRestricted, filter: .gzip, compressionLevel: 1)
+    try writer.addData(payload, as: "payload.bin")
+    writer.close()
+    
+    let extracted = try AKReader.extractData(for: "payload.bin", from: archivePath)
+    #expect(extracted == payload)
+}
+
+@Test func testAKWriterUnopenedOperationsThrowOrNoop() throws {
+    let writer = AKWriter()
+    let entry = AKEntry()
+    entry.pathname = "unopened.txt"
+    entry.size = 0
+    entry.fileType = .regular
+    
+    #expect(throws: (any Error).self) { try writer.writeHeader(entry) }
+    #expect(throws: (any Error).self) { _ = try writer.writeData(Data("x".utf8)) }
+    #expect(throws: (any Error).self) { try writer.writeDataBlock(Data("x".utf8), offset: 0) }
+    #expect(throws: (any Error).self) { try writer.closeMemory(context: unsafeBitCast(0, to: AKMemoryWriteContext.self)) }
+    #expect(throws: (any Error).self) { try writer.setCompressionLevel(1) }
+    #expect(throws: (any Error).self) { try writer.setFilterOption("compression-level", value: "1") }
+    #expect(throws: (any Error).self) { try writer.setFormatOption("hdrcharset", value: "UTF-8") }
+    #expect(throws: (any Error).self) { try writer.setPassphrase("secret") }
+    try writer.finishEntry()
+    #expect(!writer.isArchiveOpen)
+}
+
+@Test func testAKWriterOpenMemoryRejectsBaseMaskFormat() {
+    let writer = AKWriter()
+    #expect(throws: (any Error).self) {
+        _ = try writer.openMemory(format: .baseMask, filter: .none)
+    }
+    #expect(!writer.isArchiveOpen)
+}
+
+@Test func testAKWriterAddDirectoryCoverageForHiddenAndSymlink() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("dir_cover_\(UUID().uuidString)")
+    let archivePath = FileManager.default.temporaryDirectory.appendingPathComponent("dir_cover_\(UUID().uuidString).tar").path
+    defer {
+        try? FileManager.default.removeItem(at: root)
+        try? FileManager.default.removeItem(atPath: archivePath)
+    }
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    let visible = root.appendingPathComponent("visible.txt")
+    let hidden = root.appendingPathComponent(".hidden.txt")
+    let link = root.appendingPathComponent("visible-link")
+    try Data("visible".utf8).write(to: visible)
+    try Data("hidden".utf8).write(to: hidden)
+    try FileManager.default.createSymbolicLink(atPath: link.path, withDestinationPath: "visible.txt")
+    
+    let writer = AKWriter()
+    try writer.open(path: archivePath, format: .tarPaxRestricted, filter: .none)
+    var progressed: [String] = []
+    try writer.addDirectory(at: root.path, as: "root", includeHiddenFiles: true) { progressed.append(($0 as NSString).lastPathComponent) }
+    writer.close()
+    
+    #expect(progressed.contains("visible.txt"))
+    #expect(progressed.contains(".hidden.txt"))
+    #expect(progressed.contains("visible-link"))
+    let names = try AKReader.listEntries(at: archivePath)
+    #expect(names.contains("root/.hidden.txt"))
+    #expect(names.contains("root/visible-link"))
+}
+
+@Test func testAKWriterAddDirectoryNonExistentThrows() throws {
+    let archivePath = FileManager.default.temporaryDirectory.appendingPathComponent("missing_dir_\(UUID().uuidString).tar").path
+    defer { try? FileManager.default.removeItem(atPath: archivePath) }
+    let writer = AKWriter()
+    try writer.open(path: archivePath, format: .tarPaxRestricted, filter: .none)
+    defer { writer.close() }
+    #expect(throws: (any Error).self) {
+        try writer.addDirectory(at: "/nonexistent/archivekit/source/dir")
+    }
+}
+
+@Test func testAKReaderUnopenedOperationsThrowOrReturnDefaults() throws {
+    let reader = AKReader()
+    #expect(reader.format == nil)
+    #expect(reader.formatName == nil)
+    #expect(reader.filterCount == 0)
+    #expect(reader.fileCount == 0)
+    #expect(reader.bytesRead == 0)
+    #expect(reader.compressedBytesRead == 0)
+    #expect(reader.lastError == nil)
+    #expect(reader.lastErrorCode == 0)
+    
+    #expect(throws: (any Error).self) { _ = try reader.detectEncryption() }
+    #expect(throws: (any Error).self) { _ = try reader.verifyPassphrase() }
+    #expect(throws: (any Error).self) { _ = try reader.nextEntry() }
+    #expect(throws: (any Error).self) { _ = try reader.readCurrentEntryData() }
+    #expect(throws: (any Error).self) { _ = try reader.readDataBlock() }
+    #expect(throws: (any Error).self) { try reader.extractCurrentEntry(AKEntry()) }
+    try reader.skipCurrentEntry()
+    #expect(reader.filter(at: 0) == nil)
+    #expect(reader.filterName(at: 0) == nil)
+}
+
+@Test func testAKReaderExtendedUnopenedAndInvalidURLPaths() {
+    let reader = AKReader()
+    #expect(throws: (any Error).self) { _ = try reader.archiveInfo() }
+    #expect(throws: (any Error).self) { _ = try reader.extractAllData() }
+    #expect(throws: (any Error).self) { _ = try reader.extractData(forPaths: ["a.txt"]) }
+    #expect(throws: (any Error).self) { try reader.extractAll(to: URL(string: "https://example.com/out")!) }
+}
+
+@Test func testAKEntryAdditionalSettersAndEmptyEnumerations() {
+    let entry = AKEntry()
+    entry.pathname = "entry"
+    entry.dev = 12
+    entry.rdev = 34
+    entry.mode = 0o100644
+    entry.userName = "user"
+    entry.groupName = "group"
+    entry.hardlinkTarget = "hard-target"
+    entry.symlinkTarget = "sym-target"
+    _ = entry.sourcepath
+    #expect(entry.dev == 12)
+    #expect(entry.rdev == 34)
+    #expect(entry.userName == "user")
+    #expect(entry.groupName == "group")
+    _ = entry.hardlinkTarget
+    #expect(entry.symlinkTarget == "sym-target")
+    
+    entry.userName = nil
+    entry.groupName = nil
+    entry.hardlinkTarget = nil
+    entry.symlinkTarget = nil
+    entry.clear()
+    #expect(entry.xattrNext() == nil)
+    #expect(entry.sparseNext() == nil)
+}
+
+@Test func testAKEnumDescriptionsAndInitializersFullCoverage() {
+    for filter in AKFilter.allCases {
+        #expect(!filter.description.isEmpty)
+        #expect(AKFilter(filterCode: filter.rawValue) == filter)
+    }
+    for format in AKFormat.allCases {
+        #expect(!format.description.isEmpty)
+        #expect(AKFormat(rawValue: format.rawValue) == format)
+        _ = format.family
+        _ = format.isRealFormat
+    }
+    let flags: AKExtractFlags = [.owner, .permissions, .time, .noOverwrite, .unlink, .acl, .fflags, .xattr, .secureSymlinks, .secureNoAbsolutePaths, .secureNoDotDot]
+    let description = flags.description
+    #expect(description.contains("owner"))
+    #expect(description.contains("permissions"))
+    #expect(description.contains("secureNoDotDot"))
+}
+
+@Test func testAKErrorDescriptionsAndRecoverySuggestionsFullCoverage() {
+    let errors: [AKError] = [
+        .ok,
+        .eof,
+        .retry("retry"),
+        .warn("warn"),
+        .failed("failed"),
+        .fatal("fatal"),
+        .unknown(123, "unknown"),
+        .cannotOpenFile("file"),
+        .cannotCreateArchive("archive"),
+        .invalidPath("path"),
+        .wrongPassphrase
+    ]
+    for error in errors {
+        #expect(!error.description.isEmpty)
+        #expect(error.errorDescription != nil)
+        _ = error.failureReason
+        _ = error.recoverySuggestion
+    }
+    #expect(AKError.retry("a") == AKError.retry("a"))
+    #expect(AKError.unknown(1, "a") != AKError.unknown(2, "b"))
 }

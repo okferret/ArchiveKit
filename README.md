@@ -929,3 +929,315 @@ func createInMemoryZip(items: [(name: String, content: String)]) throws -> Data 
 本项目基于 MIT 许可证开源，详见 [LICENSE](LICENSE) 文件。
 
 libarchive 基于 BSD 2-Clause 许可证，详见 [libarchive 官网](https://libarchive.org)。
+
+---
+
+## 深入教程与最佳实践
+
+本节按常见任务给出更完整的端到端示例，建议新项目优先参考这里的写法。
+
+### 1. 安全解压一个归档
+
+解压来自用户、网络或外部系统的归档时，建议始终使用 `.standard` 或 `.safe`，避免绝对路径、`..` 路径穿越和恶意符号链接。
+
+```swift
+import Foundation
+import ArchiveKit
+
+func safelyExtractArchive(from archivePath: String, to outputDirectory: String) throws {
+    let reader = AKReader()
+    try reader.open(path: archivePath)
+    defer { reader.close() }
+
+    try reader.extractAll(
+        to: URL(fileURLWithPath: outputDirectory),
+        flags: .standard,
+        progress: { entry in
+            print("解压: \(entry.pathname ?? "(unknown)")")
+        }
+    )
+}
+```
+
+如果只想最大化安全性，不关心恢复权限、时间等元数据，可以使用：
+
+```swift
+try reader.extractAll(to: destinationURL, flags: .safe)
+```
+
+### 2. 先预览归档内容，再决定是否解压
+
+```swift
+import ArchiveKit
+
+func inspectArchive(_ path: String) throws {
+    let info = try AKReader.info(at: path)
+
+    print("格式: \(info.formatName ?? "未知")")
+    print("过滤器: \(info.filterName ?? "无")")
+    print("条目数: \(info.entryCount)")
+    print("普通文件: \(info.regularFileCount)")
+    print("目录: \(info.directoryCount)")
+    print("符号链接: \(info.symlinkCount)")
+    print("总未压缩大小: \(info.totalUncompressedSize)")
+
+    for path in info.paths {
+        print("- \(path)")
+    }
+}
+```
+
+### 3. 只读取归档中的指定文件
+
+适合从 ZIP/TAR 中读取配置文件、缩略图、元数据文件等，无需解压全部内容。
+
+```swift
+import Foundation
+import ArchiveKit
+
+func readJSONConfig(from archivePath: String) throws -> Data? {
+    try AKReader.extractData(for: "config/app.json", from: archivePath)
+}
+```
+
+如果要一次读取多个文件：
+
+```swift
+let reader = AKReader()
+try reader.open(path: archivePath)
+defer { reader.close() }
+
+let files = try reader.extractData(forPaths: [
+    "config/app.json",
+    "assets/icon.png",
+    "README.md"
+])
+
+let configData = files["config/app.json"]
+```
+
+### 4. 流式扫描大归档
+
+对于大归档，避免一次性读取所有内容。可以逐条扫描，只在命中目标时读取数据。
+
+```swift
+import Foundation
+import ArchiveKit
+
+func findFirstTextFile(in archivePath: String) throws -> Data? {
+    var result: Data?
+
+    try AKReader.stream(from: archivePath) { entry, reader in
+        guard entry.pathname?.hasSuffix(".txt") == true else {
+            return true
+        }
+
+        result = try reader.readCurrentEntryData()
+        return false
+    }
+
+    return result
+}
+```
+
+### 5. 创建 `.zip` 归档
+
+```swift
+import Foundation
+import ArchiveKit
+
+func createZip(outputPath: String, files: [String]) throws {
+    let writer = AKWriter()
+    try writer.open(path: outputPath, format: .zip, filter: .none)
+    defer { writer.close() }
+
+    for file in files {
+        try writer.addFile(at: file)
+    }
+}
+```
+
+### 6. 创建 `.tar.gz` 并设置压缩级别
+
+`compressionLevel` 取值范围为 `0...9`，数值越高通常压缩率越高但速度越慢。
+
+```swift
+import ArchiveKit
+
+func createTarGz(sourceDirectory: String, outputPath: String) throws {
+    let writer = AKWriter()
+    try writer.open(
+        path: outputPath,
+        format: .tarPaxRestricted,
+        filter: .gzip,
+        compressionLevel: 6
+    )
+    defer { writer.close() }
+
+    try writer.addDirectory(
+        at: sourceDirectory,
+        as: "payload",
+        includeHiddenFiles: false,
+        progress: { path in
+            print("添加: \(path)")
+        }
+    )
+}
+```
+
+### 7. 使用 Result Builder 声明式构建归档
+
+适合业务侧组合多个来源：磁盘文件、内存数据、空目录、符号链接、目录树。
+
+```swift
+import Foundation
+import ArchiveKit
+
+func buildReleaseBundle(outputPath: String, binaryPath: String, docsPath: String) throws {
+    let manifest = """
+    name: ExampleApp
+    version: 1.0.0
+    """.data(using: .utf8)!
+
+    try AKWriter.build(to: outputPath, configuration: .tarGz) {
+        AKArchiveItem.file(path: binaryPath, archivePath: "bin/example")
+        AKArchiveItem.directory(archivePath: "logs")
+        AKArchiveItem.data(manifest, archivePath: "manifest.yml")
+        AKArchiveItem.directoryTree(path: docsPath, archiveBasePath: "docs")
+    }
+}
+```
+
+### 8. 创建内存 ZIP 并立即读取验证
+
+```swift
+import Foundation
+import ArchiveKit
+
+func makeAndVerifyMemoryZip() throws {
+    let zipData = try AKWriter.buildToMemory(configuration: .zip) {
+        AKArchiveItem.data(Data("hello".utf8), archivePath: "hello.txt")
+        AKArchiveItem.data(Data("world".utf8), archivePath: "world.txt")
+    }
+
+    let hello = try AKReader.extractData(for: "hello.txt", from: zipData)
+    print(String(data: hello ?? Data(), encoding: .utf8) ?? "")
+}
+```
+
+### 9. 异步 API 用法
+
+异步 API 会把阻塞式 libarchive 操作放入后台任务，适合服务端、命令行工具或 UI 应用中避免阻塞主线程。
+
+```swift
+import Foundation
+import ArchiveKit
+
+func asyncExample() async throws {
+    let paths = try await AKReader.listEntriesAsync(at: "/tmp/input.zip")
+    print(paths)
+
+    try await AKWriter.archiveAsync(
+        directory: "/tmp/input-directory",
+        to: "/tmp/output.tar.gz",
+        configuration: .tarGz,
+        progress: { filePath in
+            print("添加: \(filePath)")
+        }
+    )
+
+    try await AKReader.extractAllAsync(
+        from: "/tmp/output.tar.gz",
+        to: URL(fileURLWithPath: "/tmp/extracted"),
+        flags: .standard
+    )
+}
+```
+
+### 10. 加密 ZIP 的创建与读取
+
+```swift
+import Foundation
+import ArchiveKit
+
+func createEncryptedZip(outputPath: String, passphrase: String) throws {
+    var config = AKWriterConfiguration.encryptedZip(passphrase: passphrase)
+    config.compressionLevel = 9
+
+    try AKWriter.build(to: outputPath, configuration: config) {
+        AKArchiveItem.data(Data("secret".utf8), archivePath: "secret.txt")
+    }
+}
+
+func readEncryptedZip(path: String, passphrase: String) throws -> Data? {
+    guard try AKReader.verifyPassphrase(passphrase, for: path) else {
+        throw AKError.wrongPassphrase
+    }
+
+    let reader = AKReader()
+    try reader.open(path: path, passphrases: [passphrase])
+    defer { reader.close() }
+
+    return try reader.extractData(forPaths: ["secret.txt"])["secret.txt"]
+}
+```
+
+### 11. 错误处理建议
+
+```swift
+do {
+    try safelyExtractArchive(from: "/tmp/archive.zip", to: "/tmp/output")
+} catch AKError.invalidPath(let path) {
+    print("路径无效: \(path)")
+} catch AKError.cannotOpenFile(let path) {
+    print("无法打开文件: \(path)")
+} catch AKError.wrongPassphrase {
+    print("密码错误或缺少密码")
+} catch AKError.failed(let message) {
+    print("操作失败: \(message)")
+} catch AKError.fatal(let message) {
+    print("致命错误: \(message)")
+} catch {
+    print("未知错误: \(error.localizedDescription)")
+}
+```
+
+### 12. 资源管理规则
+
+- 每次 `open` 成功后都应使用 `defer { close() }`。
+- 内存写入必须使用 `closeMemory(context:)` 获取最终数据。
+- 不要在多个线程并发访问同一个 `AKReader` 或 `AKWriter` 实例；并发任务应创建各自独立实例。
+- 遍历归档时，如果没有读取当前条目数据，应调用 `skipCurrentEntry()`，或使用 `enumerateEntries`、`entries()`、`stream` 等自动跳过的 API。
+- 密码必须在 `open(path:passphrases:)` 或 `AKWriter.open(..., passphrase:)` 阶段传入，不建议在 open 后再调用底层 option setter。
+
+### 13. 格式与过滤器选择建议
+
+| 输出文件 | 推荐 format | 推荐 filter | 说明 |
+|----------|-------------|-------------|------|
+| `.zip` | `.zip` | `.none` | 跨平台兼容性最好，适合普通文件分发 |
+| `.tar` | `.tarPaxRestricted` | `.none` | 保留 Unix 元数据，未压缩 |
+| `.tar.gz` / `.tgz` | `.tarPaxRestricted` | `.gzip` | 兼容性好，压缩率和速度均衡 |
+| `.tar.xz` | `.tarPaxRestricted` | `.xz` | 压缩率高，速度较慢 |
+| `.tar.bz2` | `.tarPaxRestricted` | `.bzip2` | 传统格式，兼容性好 |
+| `.tar.zst` | `.tarPaxRestricted` | `.zstd` | 高速且压缩率好，依赖 libarchive/zstd 支持 |
+| `.7z` | `.sevenZip` | `.none` | 依赖 libarchive 写入支持，建议按目标环境验证 |
+
+### 14. 测试与覆盖率
+
+项目使用 Swift Testing。常用命令：
+
+```bash
+xcrun swift test
+xcrun swift test --enable-code-coverage
+```
+
+生成覆盖率报告：
+
+```bash
+xcrun llvm-cov report \
+  .build/debug/ArchiveKitPackageTests.xctest/Contents/MacOS/ArchiveKitPackageTests \
+  -instr-profile .build/debug/codecov/default.profdata \
+  -ignore-filename-regex='Tests|\\.build'
+```
+
+当前已补充全功能覆盖测试，完整测试结果为 182/182 通过，源码总行覆盖率为 87.10%。

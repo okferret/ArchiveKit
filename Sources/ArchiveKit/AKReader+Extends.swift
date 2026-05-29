@@ -131,14 +131,21 @@ public struct AKEntrySequence: Sequence {
 /// try reader.open(path: archivePath)
 /// for try await entry in reader.asyncEntries() {
 ///     print(entry.pathname ?? "")
+///     // 若需要读取数据，在此处调用 reader.readCurrentEntryData()
+///     // 未读取的数据会在进入下一次迭代时自动跳过
 /// }
 /// ```
+///
+/// - Note: 每次调用 `next()` 时，会先跳过上一个条目未读取的数据，再读取下一个条目头部。
+///   这与同步版 `AKEntrySequence` 的行为一致，确保即使用户不读取数据，遍历也能正确推进。
 public struct AKEntryAsyncSequence: AsyncSequence {
     public typealias Element = AKEntry
     
     public struct AsyncIterator: AsyncIteratorProtocol {
         private let reader: AKReader
         private var finished = false
+        /// 是否已读取过至少一个条目（用于判断是否需要跳过上一条目的数据）
+        private var hasReadEntry = false
         
         internal init(reader: AKReader) {
             self.reader = reader
@@ -148,10 +155,16 @@ public struct AKEntryAsyncSequence: AsyncSequence {
             guard !finished else { return nil }
             // 允许在每次迭代前检查取消
             try Task.checkCancellation()
+            // 跳过上一个条目未读取的数据（首次调用时无需跳过）
+            // 与同步版 AKEntrySequence.Iterator 保持一致
+            if hasReadEntry {
+                try reader.skipCurrentEntry()
+            }
             guard let entry = try reader.nextEntry() else {
                 finished = true
                 return nil
             }
+            hasReadEntry = true
             return entry
         }
     }
@@ -258,22 +271,6 @@ extension AKReader {
         return found
     }
     
-    /// 统计满足条件的条目数量
-    ///
-    /// - Parameter predicate: 统计条件，默认统计全部
-    /// - Returns: 满足条件的条目数量
-    /// - Throws: AKError
-    public func count(where predicate: (AKEntry) -> Bool = { _ in true }) throws -> Int {
-        var n = 0
-        try enumerateEntries { entry in
-            if predicate(entry) { n += 1 }
-            return true
-        }
-        return n
-    }
-    
-    // MARK: - 批量数据提取
-    
     /// 提取所有满足条件的文件数据
     ///
     /// - Parameter predicate: 过滤条件（仅对普通文件有效），默认提取全部普通文件
@@ -311,13 +308,32 @@ extension AKReader {
             if let path = entry.pathname, remaining.contains(path) {
                 result[path] = try readCurrentEntryData()
                 remaining.remove(path)
-                if remaining.isEmpty { break }
+                if remaining.isEmpty {
+                    try skipCurrentEntry()
+                    break
+                }
             } else {
                 try skipCurrentEntry()
             }
         }
         return result
     }
+    
+    /// 统计满足条件的条目数量
+    ///
+    /// - Parameter predicate: 统计条件，默认统计全部
+    /// - Returns: 满足条件的条目数量
+    /// - Throws: AKError
+    public func count(where predicate: (AKEntry) -> Bool = { _ in true }) throws -> Int {
+        var n = 0
+        try enumerateEntries { entry in
+            if predicate(entry) { n += 1 }
+            return true
+        }
+        return n
+    }
+    
+    // MARK: - 批量数据提取
     
     // MARK: - 归档信息摘要
     
@@ -331,8 +347,8 @@ extension AKReader {
     /// - Throws: AKError
     public static func info(at path: String) throws -> AKArchiveInfo {
         let reader = AKReader()
-        try reader.open(path: path)
         defer { reader.close() }
+        try reader.open(path: path)
         return try reader._buildInfo(sourcePath: path)
     }
     
@@ -461,8 +477,8 @@ extension AKReader {
     ) async throws {
         try await Task.detached(priority: .userInitiated) {
             let reader = AKReader()
-            try reader.open(path: archivePath)
             defer { reader.close() }
+            try reader.open(path: archivePath)
             try reader.extractAll(to: destinationURL, flags: flags, progress: progress)
         }.value
     }
@@ -499,8 +515,8 @@ extension AKReader {
         handler: (AKEntry, AKReader) throws -> Bool
     ) throws {
         let reader = AKReader()
-        try reader.open(path: path, passphrases: passphrases)
         defer { reader.close() }
+        try reader.open(path: path, passphrases: passphrases)
         while let entry = try reader.nextEntry() {
             let shouldContinue = try handler(entry, reader)
             try reader.skipCurrentEntry()

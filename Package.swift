@@ -18,6 +18,11 @@ let package = Package(
             targets: ["ArchiveKit"]),
     ],
     dependencies: [
+        // 注意：当前使用 branch: "main" 跟踪最新提交，构建结果不可重现。
+        // 建议在生产环境中改为固定版本，例如：
+        //   .package(url: "https://github.com/okferret/libarchive.git", from: "x.y.z")
+        // 或：
+        //   .package(url: "https://github.com/okferret/libarchive.git", exact: "x.y.z")
         .package(url: "https://github.com/okferret/libarchive.git", branch: "main"),
     ],
     targets: [

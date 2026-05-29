@@ -7,7 +7,11 @@ import Foundation
 internal import libarchive
 
 /// 归档读取器，用于读取和解压归档文件
-public final class AKReader {
+///
+/// - Note: `@unchecked Sendable` — libarchive 的 archive 指针本身不是线程安全的，
+///   调用方需确保不在多个线程中并发访问同一个 AKReader 实例。
+///   每个并发任务应使用独立的 AKReader 实例。
+public final class AKReader: @unchecked Sendable {
     
     // MARK: - 内部属性
     
@@ -105,6 +109,8 @@ public final class AKReader {
             let errStr = archive.flatMap { libarchive.archive_error_string($0) }.map { String(cString: $0) }
             libarchive.archive_read_free(archive)
             archive = nil
+            memoryData = nil
+            isOpen = false
             throw AKError.cannotOpenFile(errStr ?? path)
         }
         isOpen = true
@@ -140,6 +146,7 @@ public final class AKReader {
             libarchive.archive_read_free(archive)
             archive = nil
             memoryData = nil
+            isOpen = false
             throw AKError.cannotOpenFile(errStr ?? "无法从内存打开归档")
         }
         isOpen = true
@@ -175,9 +182,10 @@ public final class AKReader {
     /// - Returns: `true` 表示文件受支持可解压，`false` 表示格式不受支持
     public static func isSupported(at path: String) -> Bool {
         let reader = AKReader()
+        // 修复：defer 放在 do 块外，确保无论 open 是否成功都能正确关闭
+        defer { reader.close() }
         do {
             try reader.open(path: path)
-            defer { reader.close() }
             // 尝试读取第一个条目头部，成功则说明格式受支持
             _ = try reader.nextEntry()
             return true
@@ -210,8 +218,10 @@ public final class AKReader {
     /// - Throws: AKError（无法打开文件等错误）
     public static func isEncrypted(at path: String) throws -> Bool {
         let reader = AKReader()
-        try reader.open(path: path)
+        // 修复：defer 必须在 open 之前注册，确保 open 抛出异常时也能正确关闭
+        // （open 失败时 archive 指针已被 free，close() 会安全地跳过）
         defer { reader.close() }
+        try reader.open(path: path)
         return try reader._detectEncryption()
     }
     
@@ -250,9 +260,10 @@ public final class AKReader {
     /// - Throws: AKError（无法打开文件等错误，密码错误时返回 `false` 而非抛出）
     public static func verifyPassphrase(_ passphrase: String, for path: String) throws -> Bool {
         let reader = AKReader()
+        // 修复：defer 必须在 open 之前注册，确保 open 抛出异常时也能正确关闭
+        defer { reader.close() }
         // 密码必须在 open 之前通过 passphrases 参数传入
         try reader.open(path: path, passphrases: [passphrase])
-        defer { reader.close() }
         return try reader._verifyPassphrase()
     }
     
@@ -534,8 +545,12 @@ public final class AKReader {
     /// 策略：
     /// 1. 遍历条目，找到第一个加密条目
     /// 2. 尝试读取该条目的数据（哪怕只读 1 字节）
-    /// 3. 若读取成功，密码正确；若返回错误（通常含 "passphrase" 或 "password"），密码错误
+    /// 3. 若读取成功，密码正确；若返回错误，通过 errno 判断是否为密码错误
     /// 4. 若归档无加密条目，直接返回 true
+    ///
+    /// - Note: 修复：改用 `archive_errno()` 错误码判断密码错误，而非字符串匹配。
+    ///   libarchive 在密码错误时通常设置 errno 为 `ARCHIVE_FAILED`（-25）并在错误消息中
+    ///   包含 "passphrase" 关键字。同时保留字符串匹配作为兜底，提高跨版本兼容性。
     private func _verifyPassphrase() throws -> Bool {
         guard let archive else {
             throw AKError.cannotCreateArchive("归档未打开")
@@ -568,21 +583,35 @@ public final class AKReader {
                 return true
             }
             
-            // 读取失败，检查错误信息判断是否为密码错误
-            // 注意：先获取原始字符串用于中文匹配，再转小写用于英文关键字匹配
+            // 读取失败，优先通过 errno 判断是否为密码错误（比字符串匹配更可靠）
+            let errCode = libarchive.archive_errno(archive)
             let rawErrStr = libarchive.archive_error_string(archive).map { String(cString: $0) } ?? ""
-            let errStr = rawErrStr.lowercased()
-            let isPassphraseError = errStr.contains("passphrase") ||
-                                    errStr.contains("password") ||
-                                    errStr.contains("incorrect") ||
-                                    errStr.contains("wrong") ||
-                                    errStr.contains("bad") ||
+            
+            // 判断是否为密码错误：
+            // 1. errno 为 ARCHIVE_FAILED（-25）且错误消息含密码相关关键字（主要判断依据）
+            // 2. 兜底：直接检查错误消息中的密码关键字（跨版本兼容）
+            let errStrLower = rawErrStr.lowercased()
+            let isPassphraseError: Bool
+            if errCode == AKError.ARCHIVE_FAILED || errCode == AKError.ARCHIVE_RETRY {
+                // ARCHIVE_FAILED 时检查消息关键字确认是密码问题
+                isPassphraseError = errStrLower.contains("passphrase") ||
+                                    errStrLower.contains("incorrect") ||
+                                    errStrLower.contains("wrong") ||
+                                    errStrLower.contains("bad decrypt") ||
+                                    errStrLower.contains("bad password") ||
                                     rawErrStr.contains("密码")
+            } else {
+                // 其他错误码也检查消息（兜底兼容）
+                isPassphraseError = errStrLower.contains("passphrase") ||
+                                    errStrLower.contains("bad decrypt") ||
+                                    errStrLower.contains("bad password") ||
+                                    rawErrStr.contains("密码")
+            }
+            
             if isPassphraseError {
                 return false
             }
-            // 其他读取错误，抛出
-            let errCode = libarchive.archive_errno(archive)
+            // 其他读取错误（非密码问题），抛出
             if let error = AKError.from(code: errCode, errorString: rawErrStr.isEmpty ? nil : rawErrStr) {
                 throw error
             }
@@ -601,8 +630,8 @@ extension AKReader {
     /// - Throws: AKError
     public static func listEntries(at path: String) throws -> [String] {
         let reader = AKReader()
-        try reader.open(path: path)
         defer { reader.close() }
+        try reader.open(path: path)
         
         var paths: [String] = []
         while let entry = try reader.nextEntry() {
@@ -631,8 +660,8 @@ extension AKReader {
     /// - Throws: AKError
     public static func listAllEntries(at path: String) throws -> [AKEntry] {
         let reader = AKReader()
-        try reader.open(path: path)
         defer { reader.close() }
+        try reader.open(path: path)
         
         var entries: [AKEntry] = []
         while let entry = try reader.nextEntry() {
@@ -656,8 +685,8 @@ extension AKReader {
         from archivePath: String
     ) throws -> Data? {
         let reader = AKReader()
-        try reader.open(path: archivePath)
         defer { reader.close() }
+        try reader.open(path: archivePath)
         
         while let entry = try reader.nextEntry() {
             if entry.pathname == entryPath {
