@@ -1,0 +1,15 @@
+{
+  "originHash" : "da3c977c3ba6f2e3b709750b76b80937d9cb5915a44cef6b040079aea8e17584",
+  "pins" : [
+    {
+      "identity" : "libarchive",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/okferret/libarchive.git",
+      "state" : {
+        "branch" : "main",
+        "revision" : "b84d41ea6ecd1ab0b0cec6d60baa806808589cd5"
+      }
+    }
+  ],
+  "version" : 3
+}
